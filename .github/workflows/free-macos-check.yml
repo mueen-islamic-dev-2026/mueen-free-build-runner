@@ -1,0 +1,18 @@
+name: Verify free macOS runner
+on:
+  push:
+    paths:
+      - .github/workflows/free-macos-check.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  free-macos-probe:
+    runs-on: macos-latest
+    timeout-minutes: 5
+    steps:
+      - name: Verify Apple build tools
+        run: |
+          sw_vers
+          xcodebuild -version
+          echo "macOS runner available"
