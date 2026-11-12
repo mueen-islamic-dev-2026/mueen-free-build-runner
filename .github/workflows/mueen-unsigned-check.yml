@@ -1,0 +1,57 @@
+name: Mueen private iOS unsigned build check
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  unsigned-ios-smoke:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    env:
+      VITE_MUEEN_OLIVE_HOME_PREVIEW: '1'
+    steps:
+      - name: Clone the private Mueen source read-only
+        shell: bash
+        env:
+          MUEEN_SOURCE_DEPLOY_KEY: ${{ secrets.MUEEN_SOURCE_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "${MUEEN_SOURCE_DEPLOY_KEY:-}" || { echo "::error::Missing private source deploy key"; exit 1; }
+          mkdir -p "$HOME/.ssh"
+          chmod 700 "$HOME/.ssh"
+          printf '%s\n' "$MUEEN_SOURCE_DEPLOY_KEY" > "$HOME/.ssh/id_ed25519"
+          chmod 600 "$HOME/.ssh/id_ed25519"
+          ssh-keyscan -t ed25519 github.com >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          chmod 600 "$HOME/.ssh/known_hosts"
+          git clone --depth 1 --branch refine/ios-royal-home-v2-20261111 git@github.com:uauz1/mueen-islamic-app.git mueen
+          rm -f "$HOME/.ssh/id_ed25519"
+          test -f mueen/ios/App/App.xcodeproj/project.pbxproj
+          test -f mueen/ios/App/MueenWidgets/MueenWidgets.swift
+      - name: Configure Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install and validate app
+        shell: bash
+        working-directory: mueen
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run lint
+          npm run qa:ios
+          npm run build
+          npx cap sync ios
+      - name: Resolve CocoaPods
+        shell: bash
+        working-directory: mueen/ios/App
+        run: |
+          set -euo pipefail
+          pod install
+      - name: Compile iOS app and widget without signing
+        shell: bash
+        working-directory: mueen/ios/App
+        run: |
+          set -euo pipefail
+          xcodebuild -workspace App.xcworkspace -scheme App -configuration Release -sdk iphoneos -destination "generic/platform=iOS" -derivedDataPath "$RUNNER_TEMP/DerivedData" CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
+          test -d "$RUNNER_TEMP/DerivedData/Build/Products/Release-iphoneos/App.app"
+          echo "Unsigned iOS app and widget compilation completed; no Apple signing credentials used."
