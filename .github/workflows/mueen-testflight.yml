@@ -93,7 +93,7 @@ jobs:
       - name: Decide signing mode
         run: |
           cd mueen
-          git fetch origin ios-signing-assets
+          git fetch --no-tags origin ios-signing-assets:refs/remotes/origin/ios-signing-assets
           if git ls-tree -r origin/ios-signing-assets --name-only | grep -q '^certs/'; then
             echo "MATCH_READONLY=true" >> "$GITHUB_ENV"
           else
