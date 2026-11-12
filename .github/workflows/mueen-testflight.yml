@@ -1,0 +1,266 @@
+name: Mueen private iOS TestFlight via free public macOS runner
+on:
+  workflow_dispatch:
+    inputs:
+      upload_to_testflight:
+        description: 'Explicit internal TestFlight upload. Never App Store public release.'
+        type: boolean
+        required: true
+        default: false
+permissions:
+  contents: read
+concurrency:
+  group: mueen-testflight-free-ci
+  cancel-in-progress: false
+jobs:
+  build-and-upload:
+    if: ${{ inputs.upload_to_testflight == true }}
+    runs-on: macos-latest
+    timeout-minutes: 45
+    env:
+      VITE_MUEEN_OLIVE_HOME_PREVIEW: '1'
+    steps:
+      - name: Checkout public workflow shell only
+        uses: actions/checkout@v4
+      - name: Checkout private Mueen source with a read-only deploy key
+        env:
+          MUEEN_SOURCE_DEPLOY_KEY: ${{ secrets.MUEEN_SOURCE_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$MUEEN_SOURCE_DEPLOY_KEY" || { echo "::error::Missing read-only source deploy key"; exit 1; }
+          mkdir -p "$HOME/.ssh"
+          chmod 700 "$HOME/.ssh"
+          printf '%s\n' "$MUEEN_SOURCE_DEPLOY_KEY" > "$HOME/.ssh/id_ed25519"
+          chmod 600 "$HOME/.ssh/id_ed25519"
+          ssh-keyscan -t ed25519 github.com >> "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          git clone --branch refine/ios-royal-home-v2-20261111 --single-branch git@github.com:uauz1/mueen-islamic-app.git mueen
+          test -f mueen/ios/App/App.xcodeproj/project.pbxproj
+      - name: Use monotonically increasing iOS build number
+        run: |
+          cd mueen
+          IOS_BUILD_NUMBER="$((3500 + GITHUB_RUN_NUMBER))"
+          echo "IOS_BUILD_NUMBER=$IOS_BUILD_NUMBER" >> "$GITHUB_ENV"
+          echo "Building Mueen iOS 1.2.8 ($IOS_BUILD_NUMBER), above previously installed 2024"
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install dependencies and verify the fixed Athan selection
+        run: |
+          cd mueen
+          npm ci
+          npm run lint
+          node --import tsx --test scripts/qa-azkar-state.test.ts scripts/qa-azkar-session.test.ts
+          node --import tsx scripts/qa-azkar-approved-content.ts
+          node --import tsx scripts/qa-official-quran.ts
+          node --import tsx scripts/qa-athan-test-selection.mjs
+          node --import tsx scripts/qa-ios-athan-catalog.mjs
+          node scripts/qa-ios-athan-native.mjs
+          npm run qa:ios
+          node scripts/qa-appstore-no-broadcast.cjs
+          node scripts/qa-ios-release-functional-gates.mjs
+          node scripts/qa-ios-release-preflight.mjs
+          npm run build
+      - name: Sync the existing iOS project without recreating it
+        run: |
+          cd mueen
+          test -f ios/App/App.xcodeproj/project.pbxproj
+          test -f ios/App/MueenWidgets/MueenWidgets.swift
+          npx cap sync ios
+          PLIST="ios/App/App/Info.plist"
+          /usr/libexec/PlistBuddy -c "Add :NSLocationWhenInUseUsageDescription string Your location is used to calculate prayer times and Qibla direction accurately." "$PLIST" || true
+          /usr/libexec/PlistBuddy -c "Add :NSLocationAlwaysAndWhenInUseUsageDescription string Your location is used to improve prayer time and Qibla accuracy." "$PLIST" || true
+          /usr/libexec/PlistBuddy -c "Add :ITSAppUsesNonExemptEncryption bool false" "$PLIST" || /usr/libexec/PlistBuddy -c "Set :ITSAppUsesNonExemptEncryption false" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $IOS_BUILD_NUMBER" "$PLIST" || true
+      - name: Install CocoaPods and Fastlane
+        run: |
+          cd mueen
+          cd ios/App
+          pod install
+          cd ../..
+          sudo gem install fastlane -N
+      - name: Prepare App Store Connect key
+        env:
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          cd mueen
+          test -n "$ASC_KEY_P8"
+          mkdir -p "$HOME/private_keys" "$HOME/.appstoreconnect/private_keys"
+          printf "%s" "$ASC_KEY_P8" > "$HOME/private_keys/AuthKey_8V83H87686.p8"
+          cp "$HOME/private_keys/AuthKey_8V83H87686.p8" "$HOME/.appstoreconnect/private_keys/AuthKey_8V83H87686.p8"
+          chmod 600 "$HOME/private_keys/AuthKey_8V83H87686.p8" "$HOME/.appstoreconnect/private_keys/AuthKey_8V83H87686.p8"
+      - name: Decide signing mode
+        run: |
+          cd mueen
+          git fetch origin ios-signing-assets
+          if git ls-tree -r origin/ios-signing-assets --name-only | grep -q '^certs/'; then
+            echo "MATCH_READONLY=true" >> "$GITHUB_ENV"
+          else
+            echo "MATCH_READONLY=false" >> "$GITHUB_ENV"
+          fi
+      - name: Install persistent signing assets
+        env:
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+
+        run: |
+          cd mueen
+          export MATCH_PASSWORD="$(printf '%s' "$ASC_KEY_P8" | shasum -a 256 | awk '{print $1}')"
+
+          mkdir -p fastlane
+          cat > fastlane/Fastfile <<'RUBY'
+          default_platform(:ios)
+          platform :ios do
+            lane :ci_signing do
+              api_key = app_store_connect_api_key(
+                key_id: "8V83H87686",
+                issuer_id: "ff2a949d-53c6-4bc2-ae2d-0e976e71f1ef",
+                key_content: ENV["ASC_KEY_P8"],
+                in_house: false
+              )
+
+              create_keychain(
+                name: "mueen-signing",
+                password: "mueen-ci",
+                default_keychain: true,
+                unlock: true,
+                timeout: 3600,
+                lock_when_sleeps: false
+              )
+
+              # Register the extension's Bundle ID using the Connect API key, not
+              # fastlane produce (which does not accept api_key).
+              require "spaceship"
+              Spaceship::ConnectAPI.token = Spaceship::ConnectAPI::Token.create(
+                key_id: "8V83H87686",
+                issuer_id: "ff2a949d-53c6-4bc2-ae2d-0e976e71f1ef",
+                key: ENV["ASC_KEY_P8"]
+              )
+              widget_id = "com.mueen.islamicapp.widgets"
+              existing_widget = Spaceship::ConnectAPI::BundleId.all.find { |bundle| bundle.identifier == widget_id }
+              unless existing_widget
+                Spaceship::ConnectAPI::BundleId.create(
+                  name: "Mueen Widgets",
+                  identifier: widget_id,
+                  platform: "IOS"
+                )
+              end
+
+              match(
+                type: "appstore",
+                app_identifier: ["com.mueen.islamicapp", "com.mueen.islamicapp.widgets"],
+                api_key: api_key,
+                git_url: "git@github.com:uauz1/mueen-islamic-app.git",
+                git_branch: "ios-signing-assets",
+
+                clone_branch_directly: true,
+                readonly: true,
+                keychain_name: "mueen-signing",
+                keychain_password: "mueen-ci",
+                skip_confirmation: true,
+                skip_docs: true
+              )
+            end
+          end
+          RUBY
+          fastlane ios ci_signing
+      - name: Build unsigned iOS device app
+        working-directory: mueen/ios/App
+        run: |
+          xcodebuild \
+            -workspace App.xcworkspace \
+            -scheme App \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CURRENT_PROJECT_VERSION="$IOS_BUILD_NUMBER" \
+            build
+      - name: Sign and package IPA
+        run: |
+          cd mueen
+          APP_PATH="$(find "$RUNNER_TEMP/DerivedData/Build/Products/Release-iphoneos" -maxdepth 1 -name '*.app' -print -quit)"
+          test -n "$APP_PATH"
+
+          APP_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP_PATH/Info.plist")"
+          echo "App bundle id: $APP_ID"
+          test "$APP_ID" = "com.mueen.islamicapp"
+
+          PROFILE=""
+          for f in "$HOME/Library/MobileDevice/Provisioning Profiles/"*.mobileprovision "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles/"*.mobileprovision; do
+            [ -f "$f" ] || continue
+            security cms -D -i "$f" > "$RUNNER_TEMP/candidate.plist" || continue
+            CANDIDATE_ID="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$RUNNER_TEMP/candidate.plist" 2>/dev/null || true)"
+            case "$CANDIDATE_ID" in
+              *.com.mueen.islamicapp) PROFILE="$f"; break ;;
+            esac
+          done
+          test -n "$PROFILE"
+
+          cp "$PROFILE" "$APP_PATH/embedded.mobileprovision"
+          security cms -D -i "$PROFILE" > "$RUNNER_TEMP/profile.plist"
+          plutil -extract Entitlements xml1 -o "$RUNNER_TEMP/entitlements.plist" "$RUNNER_TEMP/profile.plist"
+
+          security unlock-keychain -p "mueen-ci" "$HOME/Library/Keychains/mueen-signing-db"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "mueen-ci" "$HOME/Library/Keychains/mueen-signing-db"
+          IDENTITY="$(security find-identity -v -p codesigning "$HOME/Library/Keychains/mueen-signing-db" | awk -F '"' '/Apple Distribution/ {print $2; exit}')"
+          test -n "$IDENTITY"
+          echo "Using signing identity: $IDENTITY"
+
+          if [ -d "$APP_PATH/Frameworks" ]; then
+            find "$APP_PATH/Frameworks" -type d -name '*.framework' -print0 | while IFS= read -r -d '' ITEM; do
+              codesign --force --sign "$IDENTITY" --keychain "$HOME/Library/Keychains/mueen-signing-db" --timestamp "$ITEM"
+            done
+            find "$APP_PATH/Frameworks" -type f -name '*.dylib' -print0 | while IFS= read -r -d '' ITEM; do
+              codesign --force --sign "$IDENTITY" --keychain "$HOME/Library/Keychains/mueen-signing-db" --timestamp "$ITEM"
+            done
+          fi
+
+          # Fail closed if the widget has no dedicated provisioning profile.
+          if [ -d "$APP_PATH/PlugIns" ]; then
+            WIDGET_APP="$APP_PATH/PlugIns/MueenWidgets.appex"
+            test -d "$WIDGET_APP"
+            WIDGET_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$WIDGET_APP/Info.plist")"
+            APP_BUILD="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP_PATH/Info.plist")"
+            WIDGET_BUILD="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$WIDGET_APP/Info.plist")"
+            echo "App/Widget build versions: $APP_BUILD / $WIDGET_BUILD"
+            test "$APP_BUILD" = "$WIDGET_BUILD" || { echo "::error::App and widget build numbers differ"; exit 1; }
+            test "$APP_BUILD" = "$IOS_BUILD_NUMBER" || { echo "::error::Unexpected iOS build number"; exit 1; }
+            WIDGET_PROFILE=""
+            for f in "$HOME/Library/MobileDevice/Provisioning Profiles/"*.mobileprovision "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles/"*.mobileprovision; do
+              [ -f "$f" ] || continue
+              security cms -D -i "$f" > "$RUNNER_TEMP/widget-candidate.plist" || continue
+              CANDIDATE_ID="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$RUNNER_TEMP/widget-candidate.plist" 2>/dev/null || true)"
+              case "$CANDIDATE_ID" in
+                *."$WIDGET_ID") WIDGET_PROFILE="$f"; break ;;
+              esac
+            done
+            test -n "$WIDGET_PROFILE" || { echo "::error::Missing widget provisioning profile"; exit 1; }
+            cp "$WIDGET_PROFILE" "$WIDGET_APP/embedded.mobileprovision"
+            security cms -D -i "$WIDGET_PROFILE" > "$RUNNER_TEMP/widget-profile.plist"
+            plutil -extract Entitlements xml1 -o "$RUNNER_TEMP/widget-entitlements.plist" "$RUNNER_TEMP/widget-profile.plist"
+            find "$APP_PATH/PlugIns" -type d -name '*.appex' -print0 | while IFS= read -r -d '' ITEM; do
+              codesign --force --sign "$IDENTITY" --keychain "$HOME/Library/Keychains/mueen-signing-db" --timestamp --entitlements "$RUNNER_TEMP/widget-entitlements.plist" "$ITEM"
+            done
+          fi
+
+          codesign --force --sign "$IDENTITY" --keychain "$HOME/Library/Keychains/mueen-signing-db" --timestamp \
+            --entitlements "$RUNNER_TEMP/entitlements.plist" "$APP_PATH"
+          codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+
+          mkdir -p "$RUNNER_TEMP/Payload"
+          cp -R "$APP_PATH" "$RUNNER_TEMP/Payload/"
+          cd "$RUNNER_TEMP"
+          /usr/bin/zip -qry Mueen.ipa Payload
+          test -s "$RUNNER_TEMP/Mueen.ipa"
+      - name: Upload to TestFlight
+        if: ${{ inputs.upload_to_testflight == true }}
+        run: |
+          cd mueen
+          xcrun altool --upload-app \
+            --type ios \
+            --file "$RUNNER_TEMP/Mueen.ipa" \
+            --apiKey "8V83H87686" \
+            --apiIssuer "ff2a949d-53c6-4bc2-ae2d-0e976e71f1ef"
